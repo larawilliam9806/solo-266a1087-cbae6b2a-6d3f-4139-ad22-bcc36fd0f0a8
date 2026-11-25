@@ -60,6 +60,97 @@ CREATE TABLE IF NOT EXISTS reconciliations (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_reconciliations_hour_order
     ON reconciliations(hour, meter_id);
+
+-- Fast repeated-correction bookkeeping. These tables are additive so an old
+-- database file can be opened and corrected directly: init_db creates them.
+CREATE TABLE IF NOT EXISTS app_meta (
+    key          TEXT PRIMARY KEY,
+    value        TEXT NOT NULL
+);
+INSERT OR IGNORE INTO app_meta(key, value) VALUES ('tree_version', '0');
+
+-- coverage_version counts membership changes (report inserted / reading
+-- withdrawn) for one hour. Pure amount corrections do not bump it.
+CREATE TABLE IF NOT EXISTS hour_coverage (
+    hour             TEXT PRIMARY KEY,
+    coverage_version INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+
+-- Records the tree/coverage versions under which a meter's last full chain
+-- recomputation was performed, plus the chain and which nodes had conclusions.
+CREATE TABLE IF NOT EXISTS correction_basis (
+    meter_id             TEXT NOT NULL,
+    hour                 TEXT NOT NULL,
+    tree_version         INTEGER NOT NULL,
+    coverage_version     INTEGER NOT NULL,
+    chain_ids_json       TEXT NOT NULL,
+    conclusion_ids_json  TEXT NOT NULL,
+    created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (meter_id, hour)
+) WITHOUT ROWID;
+
+-- Triggers keep the change tokens honest for every write path, including
+-- direct SQL/reset scripts, so a stale fast path can never be used after the
+-- tree or the hour's reported-meter set changed.
+CREATE TRIGGER IF NOT EXISTS trg_meters_tree_insert
+AFTER INSERT ON meters
+BEGIN
+    UPDATE app_meta
+       SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+     WHERE key = 'tree_version';
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_meters_tree_delete
+AFTER DELETE ON meters
+BEGIN
+    UPDATE app_meta
+       SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+     WHERE key = 'tree_version';
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_meters_tree_update
+AFTER UPDATE ON meters
+WHEN OLD.parent_id IS NOT NEW.parent_id
+  OR OLD.sort_order IS NOT NEW.sort_order
+BEGIN
+    UPDATE app_meta
+       SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+     WHERE key = 'tree_version';
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_readings_cov_insert
+AFTER INSERT ON readings
+BEGIN
+    INSERT INTO hour_coverage(hour, coverage_version)
+    VALUES (NEW.hour, 1)
+    ON CONFLICT(hour) DO UPDATE SET
+        coverage_version = hour_coverage.coverage_version + 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_readings_cov_delete
+AFTER DELETE ON readings
+BEGIN
+    INSERT INTO hour_coverage(hour, coverage_version)
+    VALUES (OLD.hour, 1)
+    ON CONFLICT(hour) DO UPDATE SET
+        coverage_version = hour_coverage.coverage_version + 1;
+END;
+
+-- Only primary-key changes can alter the reported-meter set; amount/version
+-- updates (the correction hot path) deliberately do not fire this.
+CREATE TRIGGER IF NOT EXISTS trg_readings_cov_key_update
+AFTER UPDATE OF meter_id, hour ON readings
+BEGIN
+    INSERT INTO hour_coverage(hour, coverage_version)
+    VALUES (OLD.hour, 1)
+    ON CONFLICT(hour) DO UPDATE SET
+        coverage_version = hour_coverage.coverage_version + 1;
+    INSERT INTO hour_coverage(hour, coverage_version)
+    VALUES (NEW.hour, 1)
+    ON CONFLICT(hour) DO UPDATE SET
+        coverage_version = hour_coverage.coverage_version + 1;
+END;
 """
 
 
@@ -124,8 +215,16 @@ def write_transaction() -> Iterator[sqlite3.Connection]:
 
 def reset_database_file() -> None:
     """Test/reset helper. Removes all rows while preserving schema."""
+    # Additively upgrade old database files first so the bookkeeping tables
+    # touched below always exist.
+    init_db()
     with write_transaction() as conn:
         conn.execute("DELETE FROM reconciliations")
         conn.execute("DELETE FROM reading_events")
         conn.execute("DELETE FROM readings")
         conn.execute("DELETE FROM meters")
+        # Fast-path bookkeeping is derived state; reset it as well. The meter
+        # and reading deletes fire version triggers, so reset tokens afterwards.
+        conn.execute("DELETE FROM correction_basis")
+        conn.execute("DELETE FROM hour_coverage")
+        conn.execute("UPDATE app_meta SET value = '0' WHERE key = 'tree_version'")

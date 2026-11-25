@@ -1,6 +1,7 @@
 """Ledger use cases: registration, mutations, incremental checks and queries."""
 from __future__ import annotations
 
+import json
 import sqlite3
 from typing import Any
 
@@ -8,7 +9,19 @@ from .db import read_connection, write_transaction
 from .errors import ConflictProblem, NotFoundProblem, ValidationProblem
 from .hours import parse_hour
 from .payload import flatten_meter_payload
-from .reconcile import load_readings, load_tree, recompute_one, serialize_conclusion
+from .reconcile import (
+    fast_plan_from_stored,
+    load_readings,
+    load_tree,
+    recompute_one,
+    serialize_conclusion,
+    store_conclusion,
+)
+
+# The unpatched recompute seam. Tests/ops may monkeypatch
+# ``service.recompute_one`` to inject failures; if it has been replaced we
+# deliberately take the explicit full path so that seam is still exercised.
+_ORIG_RECOMPUTE_ONE = recompute_one
 
 
 def _meter_exists(conn: sqlite3.Connection, meter_id: str) -> sqlite3.Row | None:
@@ -21,17 +34,220 @@ def _parent_map(conn: sqlite3.Connection) -> dict[str, str | None]:
 
 
 def _self_and_ancestors(conn: sqlite3.Connection, meter_id: str) -> list[str]:
-    parents = _parent_map(conn)
+    """Return ``[meter, parent, ..., root]`` using only path rows.
+
+    Each step is a primary-key lookup, so unlike :func:`_parent_map` this never
+    scans the whole meter tree and the cost is O(depth) rather than O(tree).
+    """
     chain: list[str] = []
     current: str | None = meter_id
     seen: set[str] = set()
     while current is not None:
         if current in seen:
-            raise ConflictProblem("meter_cycle", "Meter parent relationships contain a cycle.")
+            raise ConflictProblem(
+                "meter_cycle", "Meter parent relationships contain a cycle."
+            )
         seen.add(current)
         chain.append(current)
-        current = parents.get(current)
+        row = conn.execute(
+            "SELECT parent_id FROM meters WHERE meter_id = ?", (current,)
+        ).fetchone()
+        if row is None:
+            # Absent id behaves like parent-map ``dict.get`` -> None and ends
+            # the chain (the caller has normally already checked existence).
+            break
+        current = row["parent_id"]
     return chain
+
+
+def _change_versions(conn: sqlite3.Connection, hour: str) -> tuple[int, int]:
+    row = conn.execute("SELECT value FROM app_meta WHERE key = 'tree_version'").fetchone()
+    try:
+        tree_version = int(row["value"]) if row is not None else 0
+    except (TypeError, ValueError):
+        tree_version = 0
+    row = conn.execute(
+        "SELECT coverage_version FROM hour_coverage WHERE hour = ?", (hour,)
+    ).fetchone()
+    coverage_version = int(row["coverage_version"]) if row is not None else 0
+    return tree_version, coverage_version
+
+
+def _save_basis(
+    conn: sqlite3.Connection,
+    *,
+    meter_id: str,
+    hour: str,
+    tree_version: int,
+    coverage_version: int,
+    chain_ids: list[str],
+    conclusion_ids: list[str],
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO correction_basis (
+            meter_id, hour, tree_version, coverage_version,
+            chain_ids_json, conclusion_ids_json
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(meter_id, hour) DO UPDATE SET
+            tree_version = excluded.tree_version,
+            coverage_version = excluded.coverage_version,
+            chain_ids_json = excluded.chain_ids_json,
+            conclusion_ids_json = excluded.conclusion_ids_json,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        """,
+        (
+            meter_id,
+            hour,
+            tree_version,
+            coverage_version,
+            json.dumps(chain_ids, ensure_ascii=False),
+            json.dumps(conclusion_ids, ensure_ascii=False),
+        ),
+    )
+
+
+def _fast_recompute_chain(
+    conn: sqlite3.Connection,
+    *,
+    meter_id: str,
+    hour: str,
+    new_amount: int,
+    old_amount: int | None,
+    chain_ids: list[str],
+    tree_version: int,
+    coverage_version: int,
+) -> list[dict[str, Any]] | None:
+    """Derive chain conclusions from stored ones without loading tree/readings.
+
+    Returns the serialized conclusions (bottom-up), or ``None`` when the fast
+    path is not provably equivalent and the caller must do a full recompute.
+    """
+    basis = conn.execute(
+        "SELECT * FROM correction_basis WHERE meter_id = ? AND hour = ?",
+        (meter_id, hour),
+    ).fetchone()
+    if basis is None:
+        return None
+    if int(basis["tree_version"]) != tree_version:
+        return None
+    if int(basis["coverage_version"]) != coverage_version:
+        return None
+
+    try:
+        basis_chain = json.loads(basis["chain_ids_json"])
+        expected_ids = json.loads(basis["conclusion_ids_json"])
+    except (TypeError, ValueError):
+        return None
+    if basis_chain != chain_ids or not isinstance(expected_ids, list):
+        return None
+
+    if chain_ids:
+        marks = ",".join("?" for _ in chain_ids)
+        rows = conn.execute(
+            f"SELECT * FROM reconciliations WHERE hour = ? AND meter_id IN ({marks})",  # noqa: S608
+            [hour, *chain_ids],
+        ).fetchall()
+    else:
+        rows = []
+    row_by_id = {row["meter_id"]: row for row in rows}
+    # Every node that had a conclusion at basis time must still have exactly
+    # that row; anything unexpected forces a safe full recomputation.
+    if set(row_by_id) != set(expected_ids):
+        return None
+
+    # Plan every write before touching conclusion rows, so a mid-chain
+    # inconsistency can still fall back to one clean full recomputation.
+    # The bulk SELECT above returned *all* existing chain rows and the set
+    # check proved they are exactly the basis conclusion ids, so chain nodes
+    # without a row are known-ineligible and need no DELETE.
+    plans: list[tuple[str, dict[str, Any]]] = []
+    for chain_id in chain_ids:
+        row = row_by_id.get(chain_id)
+        if row is None:
+            continue
+        plan = fast_plan_from_stored(
+            row,
+            target_id=meter_id,
+            new_amount=new_amount,
+            old_amount=old_amount,
+        )
+        if plan is None or plan.get("meter_id") != chain_id:
+            return None
+        plans.append((chain_id, plan))
+
+    conclusions: list[dict[str, Any]] = []
+    for chain_id, plan in plans:  # bottom-up order
+        plan.pop("meter_id", None)
+        conclusions.append(store_conclusion(conn, hour=hour, meter_id=chain_id, **plan))
+    return conclusions
+
+
+def _recompute_reading_chain(
+    conn: sqlite3.Connection,
+    *,
+    meter_id: str,
+    hour: str,
+    action: str,
+    existing: dict[str, Any] | None,
+    after_write: dict[str, Any] | None,
+    affected_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Recompute self+ancestors, using the repeated-correction fast path when safe."""
+    tree_version, coverage_version = _change_versions(conn, hour)
+
+    # The fast path only covers an amount-only write to an already existing
+    # reading: the reported-meter set is then unchanged by this request.
+    # It is also bypassed when the recompute seam has been replaced (failure
+    # injection / instrumentation), so that code path stays observable.
+    seam_is_native = recompute_one is _ORIG_RECOMPUTE_ONE
+    if (
+        seam_is_native
+        and action in {"correct", "upsert"}
+        and existing is not None
+        and after_write is not None
+    ):
+        fast = _fast_recompute_chain(
+            conn,
+            meter_id=meter_id,
+            hour=hour,
+            new_amount=int(after_write["amount"]),
+            old_amount=int(existing["amount"]),
+            chain_ids=affected_ids,
+            tree_version=tree_version,
+            coverage_version=coverage_version,
+        )
+        if fast is not None:
+            return fast
+
+    # One snapshot of this hour/tree inside the serial transaction gives a
+    # consistent recomputation. Only self + ancestors are written.
+    children, _ = load_tree(conn)
+    readings = load_readings(conn, hour)
+    conclusions: list[dict[str, Any]] = []
+    for affected_id in affected_ids:  # bottom-up order
+        conclusion = recompute_one(
+            conn,
+            affected_id,
+            hour,
+            children=children,
+            readings=readings,
+        )
+        if conclusion is not None:
+            conclusions.append(conclusion)
+
+    # Remember the coverage this result is valid under for the next correction.
+    conclusion_ids = [item["meter_id"] for item in conclusions]
+    _save_basis(
+        conn,
+        meter_id=meter_id,
+        hour=hour,
+        tree_version=tree_version,
+        coverage_version=coverage_version,
+        chain_ids=affected_ids,
+        conclusion_ids=conclusion_ids,
+    )
+    return conclusions
 
 
 def register_meters(payload: Any, *, replace: bool = False) -> dict[str, Any]:
@@ -46,6 +262,8 @@ def register_meters(payload: Any, *, replace: bool = False) -> dict[str, Any]:
             conn.execute("DELETE FROM reading_events")
             conn.execute("DELETE FROM readings")
             conn.execute("DELETE FROM meters")
+            conn.execute("DELETE FROM correction_basis")
+            conn.execute("DELETE FROM hour_coverage")
 
         existing_rows = conn.execute("SELECT meter_id, parent_id FROM meters").fetchall()
         existing = {row["meter_id"]: row["parent_id"] for row in existing_rows}
@@ -276,24 +494,21 @@ def apply_reading(
                 (meter_id, hour, existing["amount"], existing["version"]),
             )
 
-        # One snapshot of this hour/tree inside the serial transaction gives a
-        # consistent recomputation. Only self + ancestors are written.
-        children, _ = load_tree(conn)
-        readings = load_readings(conn, hour)
+        # Recompute self + ancestors. Repeated amount-only corrections of the
+        # same meter under unchanged tree/coverage use stored path conclusions;
+        # every other case takes the full tree + hour snapshot.
         affected_ids = _self_and_ancestors(conn, meter_id)
-        conclusions: list[dict[str, Any]] = []
-        for affected_id in affected_ids:  # bottom-up order
-            conclusion = recompute_one(
-                conn,
-                affected_id,
-                hour,
-                children=children,
-                readings=readings,
-            )
-            if conclusion is not None:
-                conclusions.append(conclusion)
+        conclusions = _recompute_reading_chain(
+            conn,
+            meter_id=meter_id,
+            hour=hour,
+            action=action,
+            existing=existing,
+            after_write=after_write,
+            affected_ids=affected_ids,
+        )
 
-        reading = _reading_dict(conn, meter_id, hour)
+        reading = after_write
         response: dict[str, Any] = {
             "ok": True,
             "success": True,

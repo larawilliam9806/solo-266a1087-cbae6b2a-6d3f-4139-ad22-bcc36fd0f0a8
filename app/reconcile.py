@@ -58,6 +58,138 @@ def frontier(
     return list(dict.fromkeys(used)), list(dict.fromkeys(missing))
 
 
+def used_reading_entry(used_id: str, amount: int) -> dict[str, Any]:
+    return {
+        "meter_id": used_id,
+        "meterId": used_id,
+        "meter_no": used_id,
+        "amount": amount,
+        "wh": amount,
+        "value": amount,
+    }
+
+
+def store_conclusion(
+    conn: sqlite3.Connection,
+    *,
+    hour: str,
+    meter_id: str,
+    own_amount: int,
+    is_complete: bool,
+    difference: int | None,
+    sum_used: int,
+    used_ids: list[str],
+    used_readings: list[dict[str, Any]],
+    missing_ids: list[str],
+) -> dict[str, Any]:
+    """Insert/update one conclusion using the canonical version-bump rule."""
+    conn.execute(
+        """
+        INSERT INTO reconciliations (
+            hour, meter_id, own_amount, is_complete, difference, sum_used,
+            used_meter_ids, used_readings_json, missing_meter_ids
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(hour, meter_id) DO UPDATE SET
+            own_amount = excluded.own_amount,
+            is_complete = excluded.is_complete,
+            difference = excluded.difference,
+            sum_used = excluded.sum_used,
+            used_meter_ids = excluded.used_meter_ids,
+            used_readings_json = excluded.used_readings_json,
+            missing_meter_ids = excluded.missing_meter_ids,
+            computed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            version = reconciliations.version + 1
+        """,
+        (
+            hour,
+            meter_id,
+            own_amount,
+            1 if is_complete else 0,
+            difference,
+            sum_used,
+            json.dumps(used_ids, ensure_ascii=False),
+            json.dumps(used_readings, ensure_ascii=False),
+            json.dumps(missing_ids, ensure_ascii=False),
+        ),
+    )
+    row = conn.execute(
+        "SELECT * FROM reconciliations WHERE hour = ? AND meter_id = ?",
+        (hour, meter_id),
+    ).fetchone()
+    return serialize_conclusion(row)
+
+
+def fast_plan_from_stored(
+    row: sqlite3.Row | dict[str, Any],
+    *,
+    target_id: str,
+    new_amount: int,
+    old_amount: int | None,
+) -> dict[str, Any] | None:
+    """Derive the next conclusion from a stored conclusion on the path.
+
+    With an unchanged tree and unchanged reported-meter set, the frontier IDs
+    (used/missing) are identical to when the stored conclusion was written;
+    only the corrected meter's amount (when it belongs to the frontier) or the
+    node's own amount can change. Returns ``None`` when the stored row fails a
+    consistency check; callers must then fall back to full recomputation.
+    """
+    data = dict(row)
+    meter_id = data["meter_id"]
+    try:
+        used_ids: list[str] = json.loads(data.get("used_meter_ids") or "[]")
+        used_readings: list[dict[str, Any]] = json.loads(data.get("used_readings_json") or "[]")
+        missing_ids: list[str] = json.loads(data.get("missing_meter_ids") or "[]")
+        stored_sum = int(data["sum_used"])
+        own_amount = int(data["own_amount"])
+        is_complete = bool(int(data["is_complete"]))
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+    # Stored row must be internally consistent before we trust a delta.
+    if is_complete != (not missing_ids):
+        return None
+    if [item.get("meter_id") for item in used_readings] != used_ids:
+        return None
+    if any(not isinstance(item.get("amount"), int) for item in used_readings):
+        return None
+    if sum(int(item["amount"]) for item in used_readings) != stored_sum:
+        return None
+
+    if meter_id == target_id:
+        if old_amount is not None and own_amount != int(old_amount):
+            return None
+        own_amount = int(new_amount)
+
+    target_index: int | None = None
+    for index, item in enumerate(used_readings):
+        if item.get("meter_id") == target_id:
+            target_index = index
+            break
+
+    if target_index is not None:
+        if target_id not in used_ids:
+            return None
+        if old_amount is not None and int(used_readings[target_index]["amount"]) != int(old_amount):
+            return None
+        used_readings[target_index] = used_reading_entry(target_id, int(new_amount))
+    elif target_id in used_ids:
+        return None
+
+    sum_used = sum(int(item["amount"]) for item in used_readings)
+    difference = own_amount - sum_used if is_complete else None
+    return {
+        "meter_id": meter_id,
+        "own_amount": own_amount,
+        "is_complete": is_complete,
+        "difference": difference,
+        "sum_used": sum_used,
+        "used_ids": used_ids,
+        "used_readings": used_readings,
+        "missing_ids": missing_ids,
+    }
+
+
 def recompute_one(
     conn: sqlite3.Connection,
     meter_id: str,
@@ -94,14 +226,7 @@ def recompute_one(
 
     used_ids, missing_ids = frontier(meter_id, children, readings)
     used_readings = [
-        {
-            "meter_id": used_id,
-            "meterId": used_id,
-            "meter_no": used_id,
-            "amount": readings[used_id],
-            "wh": readings[used_id],
-            "value": readings[used_id],
-        }
+        used_reading_entry(used_id, readings[used_id])
         for used_id in used_ids
         if used_id in readings
     ]
@@ -110,40 +235,18 @@ def recompute_one(
     own_amount = int(own["amount"])
     difference = own_amount - sum_used if is_complete else None
 
-    conn.execute(
-        """
-        INSERT INTO reconciliations (
-            hour, meter_id, own_amount, is_complete, difference, sum_used,
-            used_meter_ids, used_readings_json, missing_meter_ids
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(hour, meter_id) DO UPDATE SET
-            own_amount = excluded.own_amount,
-            is_complete = excluded.is_complete,
-            difference = excluded.difference,
-            sum_used = excluded.sum_used,
-            used_meter_ids = excluded.used_meter_ids,
-            used_readings_json = excluded.used_readings_json,
-            missing_meter_ids = excluded.missing_meter_ids,
-            computed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-            version = reconciliations.version + 1
-        """,
-        (
-            hour,
-            meter_id,
-            own_amount,
-            1 if is_complete else 0,
-            difference,
-            sum_used,
-            json.dumps(used_ids, ensure_ascii=False),
-            json.dumps(used_readings, ensure_ascii=False),
-            json.dumps(missing_ids, ensure_ascii=False),
-        ),
+    return store_conclusion(
+        conn,
+        hour=hour,
+        meter_id=meter_id,
+        own_amount=own_amount,
+        is_complete=is_complete,
+        difference=difference,
+        sum_used=sum_used,
+        used_ids=used_ids,
+        used_readings=used_readings,
+        missing_ids=missing_ids,
     )
-    row = conn.execute(
-        "SELECT * FROM reconciliations WHERE hour = ? AND meter_id = ?",
-        (hour, meter_id),
-    ).fetchone()
-    return serialize_conclusion(row)
 
 
 def serialize_conclusion(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
